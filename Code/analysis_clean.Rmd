@@ -1,0 +1,667 @@
+---
+title: "Analysis of UCR data"
+output: html_notebook
+---
+
+--------------
+Load Libraries
+--------------
+
+```{r}
+# xtable: print tables into LaTeX
+# zeallot: unpack returned objects from functions
+pacman::p_load(pacman, tsibble, "readxl", dplyr, haven, markdown, readr, stringr, tidyverse, xtable, did, gridExtra,zeallot)
+```
+
+------------------------------------
+Functions that load and prepare data
+------------------------------------
+
+### load_data
+```{r}
+load_data <- function(filename) {
+  # This function loads the data and creates a yearmonth column
+  # usage: df_cs <- load_data("event_study_data_1994-2016_michigan")
+  df_cs <- read_dta(paste("../Data/Processed/", filename, ".dta", sep=""))
+  # change the format of dates to datetime
+  df_cs$date <- as.Date(df_cs$date)
+  df_cs$nibrs_start_date <- as.Date(df_cs$nibrs_start_date)
+  df_cs$nibrs_start_yearmonth <- yearmonth(df_cs$nibrs_start_date)
+  df_cs$yearmonth <- yearmonth(df_cs$date)
+  return(df_cs)
+}
+```
+
+### remove_missing
+Fn: Remove ORIs that do not report consistently
+```{r}
+remove_missing <- function(df_cs) {
+  # This function removes reporting agencies that don't report consistently over time
+  # ex. df_cs <- remove_missing(df_cs)
+  data_months = length(unique(df_cs$date))
+  df_cs <- df_cs %>%
+    group_by(ori9) %>%
+    filter(n() == data_months)  
+  return(df_cs)
+}
+```
+
+### remove_high_discrepency
+Fn: Remove ORIs that have zero crime rate for some of the months, but high crime rate for other ones.
+```{r}
+remove_high_discrepency <- function(df, crime_column, freq) {
+  # This function removes ORIs if they have zero crime rate for some of the months, but large crime rate for other ones
+  # ex. df_cs <- remove_high_discrepency(df_cs, crime_rate, freq = 'monthly')
+  if (freq=='monthly'){
+      df <- df %>% 
+        group_by(ori9) %>% 
+        filter(min(crime_rate) != 0 | max(crime_column) <= 500)
+  } else if (freq=='yearly'){
+      df <- df %>%
+        group_by(ori9) %>%
+        filter(min(crime_rate) != 0 | max(crime_column) <= 5000)
+  }
+  return(df)
+}
+```
+
+Import yearmonth variable
+```{r}
+# import the file that matches a yearmonth variable to an integer to meet the requirement of the algorithm
+df_yearmonth <- read_excel("../Data/yearmonth_numeric.xlsx")
+```
+
+### data_preparation
+Fn: Prepare data for event study analysis
+```{r}
+# prepare data for event study analysis
+data_preparation <- function(df_cs, fals=NULL) {
+  # This function prepares the data for event study analysis
+  # It creates an integer value for the yearmonth variable
+  # It also factorize the ID variable and the state names
+  # ex: df_cs_numeric <- data_preparation(df_cs).
+  # ex for falsification test: df_cs_numeric <- data_preparation(df_cs, fals)
+  # merge with df_yearmonth to introduce an integer value for yearmonth variable
+  df_cs_numeric <- left_join(df_cs, df_yearmonth, by = c("date" = "yearmonth")) 
+  df_cs_numeric <- df_cs_numeric %>%  rename(date_numeric = numeric)
+  # merge on nibrs_start_date to introduce an integer value for yearmonth variable
+  df_cs_numeric <- left_join(df_cs_numeric, df_yearmonth, by = c("nibrs_start_date" = "yearmonth"))
+  df_cs_numeric <- df_cs_numeric %>% rename(nibrs_numeric = numeric)
+  # falsification
+  if(!is.null(fals)) {
+    df_cs_numeric$nibrs_numeric <- df_cs_numeric$nibrs_numeric + 12
+  }
+  df_cs_numeric$nibrs_numeric[is.na(df_cs_numeric$nibrs_numeric)] <- 0
+  # create variable to factorize the ID variable
+  df_cs_numeric$ori9_factors <- factor(df_cs_numeric$ori9)
+  df_cs_numeric$ori9_factors <- as.integer(df_cs_numeric$ori9_factors)
+  # factorize the state names
+  df_cs_numeric$state_fac <- factor(df_cs_numeric$state_name)
+  return(df_cs_numeric)
+}
+```
+
+### replace_neg
+Fn: Replace negative values with the mean of the ori
+```{r}
+replace_neg <- function(df, crime_type){
+  # The number of crimes is reported as negative for some years for some reporting agencies. These values are replaced with the mean values for the reporting agency.
+  # ex. replace_neg(df, total_crime)
+  # enquo takes the arguments and returns the value as a quosure.
+  crime_type = enquo(crime_type)
+  # inside of mutate, we ask it to unquote (using !!) so that it gets evaluated
+  df <- df %>%
+    group_by(ori9) %>%
+    mutate(!!crime_type := ifelse(!!crime_type < 0,
+                                mean(!!crime_type, na.rm=TRUE),
+                                !!crime_type)) 
+  return(df)
+}
+```
+
+### data_cleaning
+```{r}
+data_cleaning <- function(data_file, year=FALSE) {
+  # This function cleans the data, including dropping data from DC, removing agencies that did not report crime consistently throughout the data period, preparing the data for event study analysis, and grouping the data by the year (optional)
+  # removes data from DC, oris that have missing data, and oris that report zero for some months, but large numbers for other months
+  # ex. data_cleaning("event_study_data_1994-2016_robust", TRUE)
+  df <- load_data(data_file)
+  df <- df[df$state_name != "District of Columbia" & df$state_name != "", ]
+  df <- remove_missing(df)
+  df <- data_preparation(df)
+  if (year==TRUE) {
+    df <- group_by_year(df)
+    df <- remove_high_discrepency(df, crime_column="actual_all_crimes", "year") 
+  }
+  else {
+    df <- remove_high_discrepency(df, crime_column="actual_all_crimes", "date") 
+  }
+    # Use total crime column as criterion for removing ORIs with zero values because it is more reliable as a criterion. The other crime categories could have very small observations.
+    return(df)
+}
+```
+
+
+
+### event_study_plot
+Fn: Event study plot
+```{r}
+# function for event study plots
+# freq = {"monthly", "annual"}
+# ex. event_study_plot(es, xlimits = c(-174, 180), xbreaks = seq(-174, 180, by = 24),                         ylimits = c(-500, 500), ybreaks = seq(-500, 500, by = 250),                            es_mms_1994_2016, freq = annual, title="(a) Real Data")
+event_study_plot <- function(es, xlimits = NULL, xbreaks = NULL, 
+                             ylimits = NULL, ybreaks = NULL, filename, freq,
+                             title = NULL) {
+
+  if (freq == "monthly") {
+    xgap = 24
+  } 
+  else if (freq == "annual") {
+    xgap = 4
+  }
+  g <- ggdid(es, xgap = xgap)
+  if ((!is.null(xbreaks) || !is.null(xlimits)) && 
+      (!is.null(ybreaks) || !is.null(ylimits))) {
+    g <- g + scale_x_continuous(limits = xlimits, breaks = xbreaks) +
+      scale_y_continuous(limits = ylimits, breaks = ybreaks)
+  }
+  else if (!is.null(xbreaks) || !is.null(xlimits)) {
+    g <- g + scale_x_continuous(limits = xlimits, breaks = xbreaks)
+  }
+  else if (!is.null(ybreaks) || !is.null(ylimits)){
+    g <- g + scale_y_continuous(limits = ylimits, breaks = ybreaks)
+  }
+  g <- g + ggtitle(title) # add the title of the plot
+  g <- g + xlab("Years") + ylab("Change in crime count difference") # add the axis labels
+  g <- g + labs(caption = "Vertical bars are 95% confidence intervals.")
+  g <- g + theme(aspect.ratio = .6)
+  ggsave(path = "../Figures/", device = "png", 
+         filename = paste(filename, ".png", sep=""), 
+         plot = g, width = 8.75, height = 5.40, dpi = 100)
+  return(g)
+}
+```
+
+### calculate_effect_size
+Fn: Save effect size data
+```{r}
+# ex. df_es_1994_2016_mi <- calculate_effect_size(es, "crime", "1994_2016_mi", "annual")
+calculate_effect_size <- function(es, crime, file_info, freq) {
+  # freq = {"annual", "monthly"}
+  if (freq == "monthly") {
+    # calculate effect size
+    df_es <- data.frame(es$egt, es$att.egt, es$se.egt)
+    # make variable - years before / after treatment
+    df_es$year <- df_es$es.egt %/% 12 + 1
+    # average by the year
+    df_temp <- df_es %>%
+                group_by(year) %>%
+                summarise_at(vars(es.att.egt), list(name = mean))
+    # the above needs work to transform the se
+  } else if (freq == "annual") {
+    # put event study data into a dataframe
+    df_temp <- data.frame(es$egt, es$att.egt, es$se.egt)
+    df_temp <- df_temp %>%
+      rename(year = es.egt,
+             mean = es.att.egt,
+             se = es.se.egt)
+  }
+  # record effect size
+  csv_name <- paste("es_year_", crime, "_", file_info, sep = "")
+  csv_path <- paste("../Data/Processed/", csv_name, ".csv", sep="")
+  write.csv(df_temp, file = csv_path, row.names = FALSE)
+  return(df_temp)
+}
+```
+
+### make_latex_table
+Fn: Make LaTeX table
+```{r}
+make_latex_table <- function(main_dataframe, robustness_dataframe = NULL,crime_name,crime_abbr) {
+  # The function prints out a latex table
+  # Ex: make_latex_table(df_es, df_es_rc,crime_type="crime",crime_abbr="c")
+  tbl_title <- paste("Change in",crime_name)
+  # if the function is given both dataframes
+  if (!is.null(robustness_dataframe)) {
+    df_tbl <- merge(main_dataframe, robustness_dataframe, by = "year")
+    df_tbl <- subset(df_tbl, year > 0 & year < 6)
+    # rename columns
+    names(df_tbl) <- c('Years After Switch', 'Change (FBI UCR)','SE (FBI UCR)', 'Change (Alt. UCR)', 'SE (Alt. UCR)')
+    print(xtable(df_tbl, digits = c(0, 0, 2, 2, 2, 2),caption = tbl_title),caption.placement='top', include.rownames = FALSE,file=paste("../Tables/esna_", crime_abbr, ".txt", sep=""))
+  }
+  # if the function is given only one dataframe
+  else {
+    df_tbl <- main_dataframe[(main_dataframe$year < 6) & (main_dataframe$year > 0),]
+    # rename columns
+    names(df_tbl) <- c('Years After Switch', 'Change', 'SE')
+    print(xtable(df_tbl, digits = c(0, 0, 2, 2),caption = tbl_title),caption.placement='top', include.rownames = FALSE,file=paste("../Tables/esn_",crime_abbr,".txt",sep=""))
+  }
+}
+```
+
+### post_processing
+```{r}
+post_processing <- function(data_type,crime_abbr,crime_name,title,freq,alt=FALSE){
+  # this function conducts post processing after regression
+  # ex. post_processing(data_type="na",crime_abbr="c",crime_name="crime",title="Event study of total crime (Alternative UCR)","annual")
+  es <- aggte(out, type = "dynamic", na.rm = TRUE)
+  summary(es)
+  p <- event_study_plot(es, filename = paste("es_",data_type,"_",crime_abbr,"_1994_2016",sep=""), freq = "annual",
+                 title = title, xbreaks = seq(-20, 16, by = 4))
+  # calculate effect size for synthetic data
+  df <- calculate_effect_size(es=es, crime=crime_name, paste("1994_2016",data_type,sep="_"), freq = "annual")
+  if (alt==TRUE) {
+    dff <- read_csv(paste("../Data/Processed/es_year_",crime_name,"_1994_2016_n.csv",sep=""))
+    # make latex table
+    make_latex_table(main_dataframe=dff, robustness_dataframe=df,crime_name,crime_abbr)
+  }
+  else {
+    make_latex_table(main_dataframe=df,crime_name=crime_name,crime_abbr=crime_abbr)
+  }
+  return(p)
+}
+```
+
+
+-------
+FBI UCR
+-------
+### Data cleaning
+```{r}
+# this section loads the data, removes data from DC, removes reporting agencies that have high discrepancy, and removes reporting agencies that don't report consistently
+df_n <- data_cleaning("es_1994-2016", TRUE) 
+```
+
+### Total crime (national data, no covariates)
+```{r}
+df_n <- replace_neg(df_n, actual_all_crimes)
+# df_n$ln_crime_count <- log(df_n$actual_all_crimes+1)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_all_crimes", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_n,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+# it outputs a figure
+pc <- post_processing(data_type="n",crime_abbr="c",crime_name="crime",title="Event study of total crime (FBI UCR)",freq="annual",alt=FALSE)
+```
+
+### Murder
+```{r}
+df_n <- replace_neg(df_n, actual_murder)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_murder", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_n,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pm <- post_processing(data_type="n",crime_abbr="m",crime_name="murder",title="Event study of murder (FBI UCR)",freq="annual",alt=FALSE)
+```
+
+### Rape
+```{r}
+df_n <- replace_neg(df_n, actual_rape_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_rape_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_n,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+prp <- post_processing(data_type="n",crime_abbr="p",crime_name="rape",title="Event study of rape (FBI UCR)",freq="annual",alt=FALSE)
+```
+
+### Robbery
+```{r}
+df_n <- replace_neg(df_n, actual_robbery_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_robbery_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_n,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pry <- post_processing(data_type="n",crime_abbr="r",crime_name="robbery",title="Event study of robbery (FBI UCR)",freq="annual",alt=FALSE)
+```
+
+
+### Assault
+```{r}
+df_n <- replace_neg(df_n, actual_assault_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_assault_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_n,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pa <- post_processing(data_type="n",crime_abbr="a",crime_name="assault",title="Event study of assault (FBI UCR)",freq="annual",alt=FALSE)
+```
+
+
+### Aggravated Assault
+```{r}
+df_n <- replace_neg(df_n, actual_assault_aggravated)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_assault_aggravated", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_n,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+paa <- post_processing(data_type="n",crime_abbr="aa",crime_name="agg_assault",title="Event study of aggravated assault (FBI UCR)",freq="annual",alt=FALSE)
+```
+
+
+### Burglary
+```{r}
+df_n <- replace_neg(df_n, actual_burg_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_burg_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_n,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pb <- post_processing(data_type="n",crime_abbr="b",crime_name="burglary",title="Event study of burglary (FBI UCR)",freq="annual",alt=FALSE)
+```
+
+
+### Theft
+```{r}
+df_n <- replace_neg(df_n, actual_theft_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_theft_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_n,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pt <- post_processing(data_type="n",crime_abbr="t",crime_name="theft",title="Event study of theft (FBI UCR)",freq="annual",alt=FALSE)
+```
+
+
+-------
+Alt UCR
+-------
+### Data cleaning
+```{r}
+df_na <- data_cleaning("es_1994-2016_robust_exp", TRUE)
+```
+
+### Total crime (national data, SRS substitution, no covariates)
+```{r}
+# replace negative values
+df_na <- replace_neg(df_na,actual_all_crimes)
+# event study for each group for each time period
+out <- att_gt(yname = "actual_all_crimes", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1,
+              data = df_na,
+              clustervars = c("ori9_factors", "state_fac"), 
+              control_group = "notyettreated",
+              base_period = "universal",
+              est_method = "dr"
+              )
+# the following function saves the figure and saves a latex table as well
+pca <- post_processing(data_type="na",crime_abbr="c",crime_name="crime",title="Event study of total crime (Alternative UCR)",freq="annual",alt=TRUE)
+```
+
+### Murder
+```{r}
+# 9 of the values for actual_murder are negative. I replaced them with the average value for the agency
+df_na <- replace_neg(df_na,actual_murder)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_murder", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_na,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pm_a <- post_processing(data_type="na",crime_abbr="m",crime_name="murder",title="Event study of murder (Alternative UCR)",freq="annual",alt=TRUE)
+```
+
+
+### Rape
+```{r}
+# replace negative values
+df_na <- replace_neg(df_na,actual_rape_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_rape_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_na,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+prp_a <- post_processing(data_type="na",crime_abbr="p",crime_name="rape",title="Event study of rape (Alternative UCR)",freq="annual",alt=TRUE)
+```
+
+
+### Robbery
+```{r}
+df_na <- replace_neg(df_na,actual_robbery_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_robbery_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_na,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pry_a <- post_processing(data_type="na",crime_abbr="r",crime_name="robbery",title="Event study of robbery (Alternative UCR)",freq="annual",alt=TRUE)
+```
+
+
+### Assault
+```{r}
+df_na <- replace_neg(df_na,actual_assault_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_assault_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_na,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pa_a <- post_processing(data_type="na",crime_abbr="a",crime_name="assault",title="Event study of assault (Alternative UCR)",freq="annual",alt=TRUE)
+```
+
+
+### Aggravated Assault
+```{r}
+df_na <- replace_neg(df_na,actual_assault_aggravated)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_assault_aggravated", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_na,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+paa_a <- post_processing(data_type="na",crime_abbr="aa",crime_name="agg_assault",title="Event study of agg. assault (Alternative UCR)",freq="annual",alt=TRUE)
+```
+
+
+### Burglary
+```{r}
+df_na <- replace_neg(df_na,actual_burg_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_burg_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_na,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pa_b <- post_processing(data_type="na",crime_abbr="b",crime_name="burglary",title="Event study of burglary (Alternative UCR)",freq="annual",alt=TRUE)
+```
+
+
+### Theft
+```{r}
+df_na <- replace_neg(df_na,actual_theft_total)
+# event study for each group for each time period 
+out <- att_gt(yname = "actual_theft_total", 
+              tname = "year",
+              idname = "ori9_factors",
+              gname = "nibrs_year",
+              xformla = ~1, # no covariates
+              data = df_na,
+              clustervars = c("ori9_factors", "state_fac"),
+              est_method = "dr",
+              control_group = "notyettreated",
+              base_period = "universal"
+              )
+# the following function saves the figure and prints a latex table as well
+pt_a <- post_processing(data_type="na",crime_abbr="t",crime_name="theft",title="Event study of theft (Alternative UCR)",freq="annual",alt=TRUE)
+```
+
+
+## Graphing
+### get_legend
+```{r}
+mytheme <- theme(plot.title = element_text(size=8),
+            axis.title.x=element_text(size=8),
+            axis.title.y=element_text(size=8),
+            axis.text = element_text(size=8),
+            legend.position="none")
+mylabels <- labs(caption=NULL)
+get_legend<-function(myggplot){
+    tmp <- ggplot_gtable(ggplot_build(myggplot))
+    leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+    legend <- tmp$grobs[[leg]]
+    return(legend)
+}
+mylegend <- g_legend(pc)
+myytitle <- pc$labels$y
+myxtitle <- pc$labels$x
+mycaption <- pc$labels$caption
+```
+
+
+### Total crime
+```{r,fig.height=3, fig.width=7}
+# reduce spaces around the plot
+mytheme <- gridExtra::ttheme_default(
+             core = list(padding=unit(c(1, 1), "mm"))
+           )
+pc_pca <- grid.arrange(
+  arrangeGrob(pc+mytheme+mylabels,top="(a)"), 
+  arrangeGrob(pca+mytheme+mylabels,top="(b)"),
+  bottom=mylegend$grobs[[1]],ncol=2
+  )
+ggsave("../Figures/pc_pca.jpg", pc_pca, height = unit(3, "in"))
+```
+
+
+### Crime categories
+```{r, fig.height=9.5, fig.width=7}
+# murder, rape, robbery, assault
+p_p_a_1 <- grid.arrange(
+  arrangeGrob(pm+mytheme+mylabels, prp+mytheme+mylabels, pry+mytheme+mylabels, 
+              pa+mytheme+mylabels, top="(a)",ncol=1), 
+  arrangeGrob(pm_a+mytheme+mylabels, prp_a+mytheme+mylabels, pry_a+mytheme+mylabels, 
+              pa_a+mytheme+mylabels, top="(b)",ncol=1),
+  mylegend,
+  nrow=2, layout_matrix=rbind(c(1,2),c(3,3)), heights=c(9,.5))
+ggsave("../Figures/p_p_a_1.jpg", p_p_a_1, width = unit(7, "in"), height = unit(9.5, "in"))
+```
+
+```{r, fig.height=7.5, fig.width=7}
+# aggravated assault, burglary, theft
+p_p_a_2 <- grid.arrange(
+  arrangeGrob(paa+mytheme+mylabels, pb+mytheme+mylabels, pt+mytheme+mylabels, 
+              top="(a)",ncol=1), 
+  arrangeGrob(paa_a+mytheme+mylabels, pb_a+mytheme+mylabels, pt_a+mytheme+mylabels, 
+              top="(b)",ncol=1),
+  mylegend, layout_matrix=rbind(c(1,2),c(3,3)), nrow=2, heights=c(7,.5))
+ggsave("../Figures/p_p_a_2.jpg", p_p_a_2, width = unit(7, "in"), height = unit(7.5, "in"))
+```
+
+
+## Detach all libraries
+pacman::p_unload(pacman::p_loaded(), character.only = TRUE)
