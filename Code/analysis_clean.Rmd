@@ -239,29 +239,91 @@ make_latex_table <- function(main_dataframe, robustness_dataframe = NULL,crime_n
 }
 ```
 
+### did_agg
+```{r}
+did_agg <- function(crime_name,crime_abbr, data_type){
+  # this function aggregates the output into a did format, make it into a table, and store it as a .csv file
+  # it is invoked in the function `post_processing`
+  # ex. did_agg(crime_name,crime_abbr, data_type)
+  # did type aggregation
+  att <- aggte(out, type="simple", na.rm = FALSE) # if there are NA values, they will be removed, and not aggregated to create NA in the aggregate
+  # make table for did
+  dfatt <- data.frame(crime_name=numeric())
+  dfatt[1,] <- att$overall.att
+  dfatt[2,] <- att$overall.se
+  colnames(dfatt) <- crime_name
+  # store the table
+  csv_name <- paste("did_year_", crime_abbr, "_1994_2016_", data_type, sep = "")
+  csv_path <- paste("../Data/Processed/", csv_name, ".csv", sep="")
+  write.csv(dfatt, file = csv_path, row.names = FALSE)
+  return(dfatt)
+}
+```
+
+
 ### post_processing
 ```{r}
 post_processing <- function(data_type,crime_abbr,crime_name,title,freq,alt=FALSE){
   # this function conducts post processing after regression
   # ex. post_processing(data_type="na",crime_abbr="c",crime_name="crime",title="Event study of total crime (Alternative UCR)","annual")
+  # event study type aggregation
   es <- aggte(out, type = "dynamic", na.rm = TRUE)
   summary(es)
+  # event study plot
   p <- event_study_plot(es, filename = paste("es_",data_type,"_",crime_abbr,"_1994_2016",sep=""), freq = "annual",
                  title = title, xbreaks = seq(-20, 16, by = 4))
   # calculate effect size for synthetic data
   df <- calculate_effect_size(es=es, crime=crime_name, paste("1994_2016",data_type,sep="_"), freq = "annual")
+  # if we are looking at the alternative UCR, we include the original UCR in the LaTeX table for comparison. Otherwise, we only include data from the original UCR
   if (alt==TRUE) {
     dff <- read_csv(paste("../Data/Processed/es_year_",crime_name,"_1994_2016_n.csv",sep=""))
-    # make latex table
+    # make latex table for event study
     make_latex_table(main_dataframe=dff, robustness_dataframe=df,crime_name,crime_abbr)
   }
   else {
     make_latex_table(main_dataframe=df,crime_name=crime_name,crime_abbr=crime_abbr)
   }
+  # make did table
+  did_agg(crime_name=crime_name, crime_abbr=crime_abbr,data_type=data_type)
+  # return the event study plot
   return(p)
 }
 ```
 
+Test code for `did_comb`
+```{r}
+dftemp <- read_csv(paste("../Data/Processed/did_year_","c","_1994_2016_n.csv",sep=""), show_col_types = FALSE)
+dftemp2 <- read_csv(paste("../Data/Processed/did_year_","m","_1994_2016_n.csv",sep=""), show_col_types = FALSE)
+cbind(dftemp,dftemp2)
+```
+
+### did_comb
+```{r}
+did_comb <- function(data_source){
+  # this function combines did results from separate tables
+  # see --did-- subsections in each regression section for details
+  dftemp <- read_csv(paste("../Data/Processed/did_year_","c","_1994_2016_", data_source, ".csv",sep=""), show_col_types = FALSE)
+  did_crime_names <- list("m","p","r","a","aa","b","t")
+  # this function combines the did regression results across different types of crime
+  for (crime_name in did_crime_names){
+    dftemp2 <- read_csv(paste("../Data/Processed/did_year_", crime_name, "_1994_2016_", data_source, ".csv",sep=""), show_col_types = FALSE)
+    dftemp <- cbind(dftemp, dftemp2)
+  }
+  return(dftemp)
+}
+```
+
+### did_latex
+```{r}
+did_latex <- function(did_combd,tbl_title = NULL,data_source){
+  # change the name of the columns
+  names(did_combd) <- c('Total Crime', 'Murder', 'Rape', 'Robbery', 'Assault', 'Aggravated Assault', 'Burglary', 'Theft')
+  # change the names of the rows
+  rownames(did_combd) <- c("Mean", "SE")
+  # make the table
+  print(xtable(did_combd, digits = c(2, 2, 2, 2, 2, 2, 2, 2, 2),caption = tbl_title), caption.placement='top', file=paste("../Tables/did_", data_source, ".txt", sep=""))
+}
+```
 
 -------
 FBI UCR
@@ -275,7 +337,6 @@ df_n <- data_cleaning("es_1994-2016", TRUE)
 ### Total crime (national data, no covariates)
 ```{r}
 df_n <- replace_neg(df_n, actual_all_crimes)
-# df_n$ln_crime_count <- log(df_n$actual_all_crimes+1)
 # event study for each group for each time period 
 out <- att_gt(yname = "actual_all_crimes", 
               tname = "year",
@@ -354,6 +415,9 @@ pry <- post_processing(data_type="n",crime_abbr="r",crime_name="robbery",title="
 ### Assault
 ```{r}
 df_n <- replace_neg(df_n, actual_assault_total)
+# did for assault
+didreg_a = lm(actual_assault_total ~ nibrs + year + did, data=df_n)
+summary(didreg_a)
 # event study for each group for each time period 
 out <- att_gt(yname = "actual_assault_total", 
               tname = "year",
@@ -430,6 +494,18 @@ out <- att_gt(yname = "actual_theft_total",
 pt <- post_processing(data_type="n",crime_abbr="t",crime_name="theft",title="Event study of theft (FBI UCR)",freq="annual",alt=FALSE)
 ```
 
+### --DiD--
+Combine did results
+```{r}
+did_combd <- did_comb(data_source = "n")
+```
+
+
+Make LaTeX table
+```{r}
+did_latex(did_combd = did_combd, data_source = "n")
+```
+
 
 -------
 Alt UCR
@@ -456,7 +532,7 @@ out <- att_gt(yname = "actual_all_crimes",
               est_method = "dr"
               )
 # the following function saves the figure and saves a latex table as well
-pca <- post_processing(data_type="na",crime_abbr="c",crime_name="crime",title="Event study of total crime (Alternative UCR)",freq="annual",alt=TRUE)
+pc_a <- post_processing(data_type="na",crime_abbr="c",crime_name="crime",title="Event study of total crime (Alternative UCR)",freq="annual",alt=TRUE)
 ```
 
 ### Murder
@@ -577,7 +653,7 @@ out <- att_gt(yname = "actual_burg_total",
               base_period = "universal"
               )
 # the following function saves the figure and prints a latex table as well
-pa_b <- post_processing(data_type="na",crime_abbr="b",crime_name="burglary",title="Event study of burglary (Alternative UCR)",freq="annual",alt=TRUE)
+pb_a <- post_processing(data_type="na",crime_abbr="b",crime_name="burglary",title="Event study of burglary (Alternative UCR)",freq="annual",alt=TRUE)
 ```
 
 
@@ -598,6 +674,20 @@ out <- att_gt(yname = "actual_theft_total",
               )
 # the following function saves the figure and prints a latex table as well
 pt_a <- post_processing(data_type="na",crime_abbr="t",crime_name="theft",title="Event study of theft (Alternative UCR)",freq="annual",alt=TRUE)
+```
+
+
+
+### --DiD--
+Combine did results
+```{r}
+did_combd <- did_comb(data_source = "na")
+```
+
+
+Make LaTeX table
+```{r}
+did_latex(did_combd = did_combd, data_source = "na")
 ```
 
 
